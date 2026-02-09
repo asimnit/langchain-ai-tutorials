@@ -17,6 +17,7 @@ from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
 
@@ -207,8 +208,12 @@ def should_continue(state: AgentState) -> Literal["tools", "end"]:
 # BUILD THE GRAPH
 # =============================================================================
 
+# Initialize memory checkpointer for persistent conversation history
+memory = MemorySaver()
+
+
 def create_agent():
-    """Create and compile the customer support agent graph."""
+    """Create and compile the customer support agent graph with memory."""
     builder = StateGraph(AgentState)
     
     # Add nodes
@@ -224,7 +229,8 @@ def create_agent():
     )
     builder.add_edge("tools", "agent")
     
-    return builder.compile()
+    # Compile with memory checkpointer for automatic history management
+    return builder.compile(checkpointer=memory)
 
 
 agent = create_agent()
@@ -236,10 +242,11 @@ agent = create_agent()
 
 async def stream_agent_response(
     user_message: str,
-    conversation_history: list[BaseMessage]
+    thread_id: str
 ) -> AsyncGenerator[dict, None]:
     """
     Stream agent responses as structured events for the frontend.
+    Uses LangGraph's MemorySaver for automatic conversation history management.
     
     Event types:
     - thinking: Agent is processing
@@ -248,37 +255,44 @@ async def stream_agent_response(
     - response: Text response (streaming)
     - done: Conversation turn complete
     - error: An error occurred
+    
+    Args:
+        user_message: The user's message
+        thread_id: Unique thread identifier for conversation memory
     """
     
-    # Add user message to history
-    messages = conversation_history + [HumanMessage(content=user_message)]
+    # Configuration for memory checkpointer
+    config = {"configurable": {"thread_id": thread_id}}
     
-    # Add system prompt if not present
-    if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+    # Input with just the new user message - history is managed by checkpointer
+    input_messages = [HumanMessage(content=user_message)]
+    
+    # Check if this is a new conversation and add system prompt
+    state = agent.get_state(config)
+    if not state.values.get("messages"):
+        input_messages = [SystemMessage(content=SYSTEM_PROMPT)] + input_messages
     
     try:
         # Signal thinking
         yield {"type": "thinking", "content": "Analyzing your request..."}
         
-        while True:
-            # Call the model with streaming
-            print(f"[Agent] Calling LLM with {len(messages)} messages...")
+        # Stream using astream_events for fine-grained control
+        accumulated_content = ""
+        
+        async for event in agent.astream_events(
+            {"messages": input_messages},
+            config=config,
+            version="v2"
+        ):
+            kind = event["event"]
             
-            # Accumulate response while streaming
-            accumulated_content = ""
-            accumulated_tool_calls = []
-            full_response = None
-            
-            async for chunk in llm_with_tools.astream(messages):
-                full_response = chunk if full_response is None else full_response + chunk
-                
-                # Stream text content as it arrives
+            # Handle LLM streaming tokens
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
                 if chunk.content:
                     if isinstance(chunk.content, str):
-                        if chunk.content:
-                            accumulated_content += chunk.content
-                            yield {"type": "response", "content": chunk.content, "done": False}
+                        accumulated_content += chunk.content
+                        yield {"type": "response", "content": chunk.content, "done": False}
                     elif isinstance(chunk.content, list):
                         for block in chunk.content:
                             if isinstance(block, dict) and block.get("type") == "text":
@@ -286,93 +300,34 @@ async def stream_agent_response(
                                 if text:
                                     accumulated_content += text
                                     yield {"type": "response", "content": text, "done": False}
-                
-                # Accumulate tool calls (they come in chunks too)
-                if hasattr(chunk, 'tool_call_chunks') and chunk.tool_call_chunks:
-                    for tc_chunk in chunk.tool_call_chunks:
-                        # Find or create tool call entry
-                        idx = tc_chunk.get('index', 0)
-                        while len(accumulated_tool_calls) <= idx:
-                            accumulated_tool_calls.append({"name": "", "args": "", "id": ""})
-                        if tc_chunk.get('name'):
-                            accumulated_tool_calls[idx]['name'] = tc_chunk['name']
-                        if tc_chunk.get('args'):
-                            accumulated_tool_calls[idx]['args'] += tc_chunk['args']
-                        if tc_chunk.get('id'):
-                            accumulated_tool_calls[idx]['id'] = tc_chunk['id']
             
-            # Parse accumulated tool call args from JSON strings
-            parsed_tool_calls = []
-            for tc in accumulated_tool_calls:
-                if tc['name']:
-                    try:
-                        args = json.loads(tc['args']) if tc['args'] else {}
-                    except json.JSONDecodeError:
-                        args = {}
-                    parsed_tool_calls.append({
-                        "name": tc['name'],
-                        "args": args,
-                        "id": tc['id']
-                    })
-            
-            print(f"[Agent] Stream complete. Content length: {len(accumulated_content)}, Tool calls: {len(parsed_tool_calls)}")
-            
-            # Check for tool calls
-            if parsed_tool_calls:
-                # Signal end of any streamed content before tool execution
-                if accumulated_content:
-                    yield {"type": "response", "content": "", "done": True}
-                
-                # Add assistant response with tool calls to history ONCE
-                messages.append(full_response)
-                
-                # Execute all tools and collect results
-                from langchain_core.messages import ToolMessage
-                tool_map = {t.name: t for t in tools}
-                
-                for tool_call in parsed_tool_calls:
-                    tool_name = tool_call["name"]
-                    tool_args = tool_call["args"]
-                    
-                    # Emit tool call event
-                    yield {
-                        "type": "tool_call",
-                        "name": tool_name,
-                        "args": tool_args
-                    }
-                    
-                    # Execute the tool
-                    tool_result = await tool_map[tool_name].ainvoke(tool_args)
-                    
-                    # Emit tool result event
-                    yield {
-                        "type": "tool_result",
-                        "name": tool_name,
-                        "result": tool_result
-                    }
-                    
-                    # Add tool result to history
-                    messages.append(ToolMessage(
-                        content=str(tool_result),
-                        tool_call_id=tool_call["id"]
-                    ))
-                
-                # Continue the loop to get the final response
-                yield {"type": "thinking", "content": "Processing tool results..."}
-                continue
-            
-            # No tool calls - mark streaming as done
-            if accumulated_content:
-                yield {"type": "response", "content": "", "done": True}
-            else:
-                # Handle empty response
+            # Handle tool calls
+            elif kind == "on_tool_start":
+                tool_input = event["data"].get("input", {})
+                # Ensure args are JSON serializable
+                if not isinstance(tool_input, dict):
+                    tool_input = {"input": str(tool_input)}
                 yield {
-                    "type": "response",
-                    "content": "I've processed your request. Is there anything else I can help you with?",
-                    "done": True
+                    "type": "tool_call",
+                    "name": event["name"],
+                    "args": tool_input
                 }
             
-            break
+            # Handle tool results
+            elif kind == "on_tool_end":
+                output = event["data"].get("output", "")
+                # Convert to string if it's a message object
+                if hasattr(output, "content"):
+                    output = output.content
+                yield {
+                    "type": "tool_result",
+                    "name": event["name"],
+                    "result": str(output)
+                }
+                yield {"type": "thinking", "content": "Processing tool results..."}
+        
+        # Mark streaming as done
+        yield {"type": "response", "content": "", "done": True}
         
         # Signal completion
         yield {"type": "done", "messages": [{"role": "assistant", "content": accumulated_content}]}
@@ -384,6 +339,12 @@ async def stream_agent_response(
         yield {"type": "error", "content": str(e)}
 
 
-def get_initial_messages() -> list[BaseMessage]:
-    """Return an empty conversation history."""
-    return []
+def clear_conversation(thread_id: str) -> None:
+    """Clear conversation history for a thread."""
+    # Delete all checkpoints for this thread
+    config = {"configurable": {"thread_id": thread_id}}
+    # Get current state and check if it exists
+    state = agent.get_state(config)
+    if state.values:
+        # Update with empty messages to clear history
+        agent.update_state(config, {"messages": []})

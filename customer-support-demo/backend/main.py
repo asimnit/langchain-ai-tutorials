@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
-from agent import stream_agent_response, get_initial_messages
+from agent import stream_agent_response, clear_conversation
 
 app = FastAPI(title="Customer Support API")
 
@@ -24,29 +24,18 @@ app.add_middleware(
 )
 
 
-# Store conversations per WebSocket connection (session-based)
+# Store active WebSocket connections (history is now managed by LangGraph MemorySaver)
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
-        self.conversations: dict[str, list[BaseMessage]] = {}
     
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
         self.active_connections[client_id] = websocket
-        self.conversations[client_id] = get_initial_messages()
     
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
             del self.active_connections[client_id]
-        if client_id in self.conversations:
-            del self.conversations[client_id]
-    
-    def get_history(self, client_id: str) -> list[BaseMessage]:
-        return self.conversations.get(client_id, [])
-    
-    def add_message(self, client_id: str, message: BaseMessage):
-        if client_id in self.conversations:
-            self.conversations[client_id].append(message)
 
 
 manager = ConnectionManager()
@@ -91,15 +80,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     await websocket.send_json({"type": "error", "content": "Empty message"})
                     continue
                 
-                # Get conversation history
-                history = manager.get_history(client_id)
-                
-                # Add user message to history
-                manager.add_message(client_id, HumanMessage(content=user_content))
-                
-                # Stream agent response
+                # Stream agent response - history is managed by MemorySaver via thread_id
                 full_response = ""
-                async for event in stream_agent_response(user_content, history):
+                async for event in stream_agent_response(user_content, client_id):
                     print(f"[WS] Sending event: {event['type']} - {str(event)[:100]}")
                     await websocket.send_json(event)
                     
@@ -108,14 +91,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         full_response += event.get("content", "")
                 
                 print(f"[WS] Done streaming. Full response length: {len(full_response)}")
-                
-                # Add assistant response to history
-                if full_response:
-                    manager.add_message(client_id, AIMessage(content=full_response))
             
             elif message.get("type") == "clear":
-                # Clear conversation history
-                manager.conversations[client_id] = get_initial_messages()
+                # Clear conversation history via MemorySaver
+                clear_conversation(client_id)
                 await websocket.send_json({"type": "cleared"})
             
             elif message.get("type") == "ping":
