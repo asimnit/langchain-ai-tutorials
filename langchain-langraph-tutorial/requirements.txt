@@ -1,0 +1,22 @@
+# LangChain + LangGraph Tutorial Requirements
+# Install with: pip install -r requirements.txt
+
+# Core LangChain
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-anthropic>=0.1.0  # For Claude on Azure AI Foundry
+langchain-openai>=0.1.0     # For Azure OpenAI Embeddings
+
+# LangGraph
+langgraph>=0.1.0
+
+# For vector stores / RAG
+chromadb>=0.4.0
+faiss-cpu>=1.7.0
+
+# Utility
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Optional: for visualization
+graphviz>=0.20.0
